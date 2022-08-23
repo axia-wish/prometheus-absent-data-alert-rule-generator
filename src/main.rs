@@ -91,6 +91,7 @@ struct PrometheusAbsentSelectorAlertRule {
     expr: String,
     selector_expr: String,
     r#for: prometheus_parser::PromDuration,
+    file: String,
 }
 
 impl Into<PrometheusRule> for PrometheusAbsentSelectorAlertRule {
@@ -107,7 +108,8 @@ impl Into<PrometheusRule> for PrometheusAbsentSelectorAlertRule {
         let labels: BTreeMap<String, String> = btree_map! {
             // Don't blow up someone's day or wake them up because of this. We
             // want to know about it but on-call can get to it in due time.
-            "severity" => "low_urgency_page"
+            "severity" => "low_urgency_page",
+            "file" => self.file
         };
 
         let annotations_mapping: serde_yaml::Mapping = btree_to_yaml_mapping(annotations);
@@ -173,6 +175,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+//helper function to print out object type, for debugging and developing 
+//uncomment when needed for debugging
+//fn print_type_of<T>(_: &T) {
+//    println!("{}", std::any::type_name::<T>())
+//}
+
 /// Process the given rules directory, outputting the absent rules file to
 /// `output_file`.
 ///
@@ -216,7 +224,7 @@ fn process_rules_dir<P: AsRef<Path>>(
         .collect();
 
     // Get a list of _all_ the selectors we use.
-    let selectors: Vec<SelectorWithOriginRule> = rule_files
+    let selectors: Vec<(SelectorWithOriginRule, String)> = rule_files
         .iter()
         .flat_map(|path| {
             // If the output file is already there ignore it. We're going to
@@ -252,13 +260,22 @@ fn process_rules_dir<P: AsRef<Path>>(
                         false
                     }
                 };
+            let skip_tahoe = Regex::new(r"^.*/tahoe.rules.yml").unwrap();
             if path_is_output_file {
+                vec![]
+            } else if skip_tahoe.is_match(&(path.display().to_string())) {
+                println!("Skipping tahoe rules file: {}", path.display());
                 vec![]
             } else {
                 match get_selectors_in_file(&path) {
-                    Ok(selectors) => selectors,
+                    Ok(selectors) => {
+                        println!("Getting selectors from: {}", path.display());
+                        //print_type_of(path); -> PathBuf
+                        selectors
+                    }
                     Err(e) => {
                         log::error!("Failed to get selectors from file: {}", e);
+                        log::error!("{}", path.display());
                         failure = true;
                         vec![]
                     }
@@ -266,12 +283,12 @@ fn process_rules_dir<P: AsRef<Path>>(
             }
         })
         .collect();
-    let grouped_selectors: Vec<(String, Vec<SelectorWithOriginRule>)> = selectors
+    let grouped_selectors: Vec<(String, Vec<(SelectorWithOriginRule, String)>)> = selectors
         .iter()
-        .sorted_by_key(|selector| selector.sort_key())
-        .group_by(|selector| selector.sort_key())
+        .sorted_by_key(|(selector, file)| (selector.sort_key(), file))
+        .group_by(|(selector, file)| (selector.sort_key(), file))
         .into_iter()
-        .filter_map(|(selector, group)| {
+        .filter_map(|((selector, _file), group)| {
             if metrics_to_ignore.contains(&selector) {
                 None
             } else {
@@ -308,13 +325,14 @@ fn process_rules_dir<P: AsRef<Path>>(
 /// This is where the logic for adopting certain attributes from the selector
 /// origin rules is contained. Currently we do this for the "for" field, where
 /// we take the smallest "for" then use it or 1h, whichever is larger.
-fn merge_selectors_into_rule(selectors: &[SelectorWithOriginRule]) -> PrometheusRule {
-    let name = build_absent_selector_alert_name(&selectors.first().unwrap().selector);
-    let function = wrap_selector_in_absent(&selectors.first().unwrap().selector);
+/// FIXING NOW
+fn merge_selectors_into_rule(selectors: &[(SelectorWithOriginRule, String)]) -> PrometheusRule {
+    let name = &selectors.first().unwrap().0.selector;
+    let function = &selectors.first().unwrap().0.selector;
     let shortest_for = selectors
         .iter()
         .flat_map(|s| {
-            s.rule
+            s.0.rule
                 .untyped_fields
                 .get("for")
                 .and_then(|val| val.as_str())
@@ -349,11 +367,13 @@ fn merge_selectors_into_rule(selectors: &[SelectorWithOriginRule]) -> Prometheus
         .map(|duration| max(duration, prometheus_parser::PromDuration::Hours(1)))
         .unwrap_or(prometheus_parser::PromDuration::Hours(1));
     PrometheusAbsentSelectorAlertRule {
-        name,
+        name: name.to_string(),
         expr: function.to_string(),
-        selector_expr: selectors.first().unwrap().selector.to_string(),
+        selector_expr: selectors.first().unwrap().0.selector.to_string(),
         r#for: chosen_for,
+        file: selectors.first().unwrap().1.clone(),
     }
+    
     .into()
 }
 
@@ -423,9 +443,10 @@ fn write_generated_config_to_file<P: AsRef<Path>, C: Serialize>(path: P, config:
     Ok(fs::write(path, contents)?)
 }
 
-fn get_selectors_in_file<P: AsRef<Path>>(rules_path: P) -> Result<Vec<SelectorWithOriginRule>> {
+
+fn get_selectors_in_file<P: AsRef<Path>>(rules_path: P) -> Result<Vec<(SelectorWithOriginRule, String)>> {
     let config = load_rules_from_file(&rules_path)?;
-    let mut selectors: Vec<SelectorWithOriginRule> = vec![];
+    let mut selectors: Vec<(SelectorWithOriginRule, String)> = vec![];
     let mut failed = false;
     for group in config.groups {
         for rule in group.rules {
@@ -437,12 +458,14 @@ fn get_selectors_in_file<P: AsRef<Path>>(rules_path: P) -> Result<Vec<SelectorWi
                     continue;
                 }
             };
-            let mut rule_selectors: Vec<SelectorWithOriginRule> = expr_selectors
+            //For debugging
+            //print_type_of(&rules_path);
+            let mut rule_selectors: Vec<(SelectorWithOriginRule, String)> = expr_selectors
                 .into_iter()
-                .map(|selector| SelectorWithOriginRule {
+                .map(|selector| (SelectorWithOriginRule {
                     selector,
                     rule: rule.clone(),
-                })
+                }, rules_path.as_ref().to_path_buf().into_os_string().into_string().unwrap()))
                 .collect();
             selectors.append(&mut rule_selectors);
             // Also explicitly get the recordings we've defined. Even if
@@ -454,10 +477,10 @@ fn get_selectors_in_file<P: AsRef<Path>>(rules_path: P) -> Result<Vec<SelectorWi
                 if let Some(record_name) = maybe_record_name {
                     match prometheus_parser::parse_expr(record_name) {
                         Ok(prometheus_parser::Expression::Selector(selector)) => {
-                            selectors.push(SelectorWithOriginRule {
+                            selectors.push((SelectorWithOriginRule {
                                 selector,
                                 rule: rule.clone(),
-                            });
+                            },  rules_path.as_ref().to_path_buf().into_os_string().into_string().unwrap()));
                         }
                         Ok(_) => {
                             log::error!("Expected record name '{}' to be a selector", record_name);
@@ -801,6 +824,7 @@ mod test {
         };
         let labels: BTreeMap<String, String> = btree_map! {
             "severity" => "low_urgency_page"
+            "file" => path.display()
         };
         let expected_rule = PrometheusRule {
             expr: "absent(some_expr)".into(),
